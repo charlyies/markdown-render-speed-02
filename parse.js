@@ -618,35 +618,71 @@ function scanInline(s, refs) {
         continue;
       }
     }
-    // email autolink: only tried at the start of a local-part run
-    if (extOk && isEmailLocalChar(c) && atEmailRunStart()) {
-      // lengths of opening "_" delimiters seen so far in this run,
-      // so a "_" run after the domain can be recognised as the
-      // closing delimiter (see parseEmailDomain)
-      let openUnderscoreLens = null;
-      for (let k = items.length - 1; k >= 0; k--) {
-        const it = items[k];
-        if (it.t === "delim" && it.ch === "_" && it.canOpen) {
-          if (!openUnderscoreLens) openUnderscoreLens = new Set();
-          openUnderscoreLens.add(it.len);
+    // email autolink: only tried at the start of a local-part run.
+    // Fast run-start check: a run starts unless the previous source
+    // char is an email-local char kept as text. Letters, digits and
+    // non-delimiter local punctuation are always text, and whitespace
+    // is always a boundary, so only "*", "_" and "~" (which may have
+    // become emphasis delimiters) need the tokenized check.
+    // Gate on "@" after the local run first: the backward scan for
+    // open "_" delimiters is O(items) and must not run for every word
+    // (matchEmail returns null without "@" anyway).
+    if (extOk && isEmailLocalChar(c)) {
+      let runStart;
+      if (i === 0) {
+        runStart = true;
+      } else {
+        const prev = s.charCodeAt(i - 1);
+        if (prev === 42 || prev === 95 || prev === 126) {
+          runStart = atEmailRunStart();
+        } else if (
+          prev === 32 || prev === 10 || prev === 9 ||
+          !isEmailLocalChar(s[i - 1])
+        ) {
+          runStart = true;
+        } else {
+          runStart = false;
         }
       }
-      const em = matchEmail(s, i, openUnderscoreLens);
-      if (em && !autolinkBlocked(i, em.end)) {
-        flush();
-        items.push(em.node);
-        i = em.end;
-        continue;
+      if (runStart) {
+        let j = i;
+        while (j < n && isEmailLocalChar(s[j])) j++;
+        if (j < n && s[j] === "@") {
+          // lengths of opening "_" delimiters seen so far in this run,
+          // so a "_" run after the domain can be recognised as the
+          // closing delimiter (see parseEmailDomain)
+          let openUnderscoreLens = null;
+          for (let k = items.length - 1; k >= 0; k--) {
+            const it = items[k];
+            if (it.t === "delim" && it.ch === "_" && it.canOpen) {
+              if (!openUnderscoreLens) openUnderscoreLens = new Set();
+              openUnderscoreLens.add(it.len);
+            }
+          }
+          const em = matchEmail(s, i, openUnderscoreLens);
+          if (em && !autolinkBlocked(i, em.end)) {
+            flush();
+            items.push(em.node);
+            i = em.end;
+            continue;
+          }
+        }
       }
     }
-    // scheme:email autolink: only tried at the start of a lowercase word
+    // scheme:email autolink: only tried at the start of a lowercase word.
+    // Gate on ":" after the word first: the regex in matchSchemeEmail
+    // must not run for every word (it returns null without ":" anyway).
     if (extOk && c >= "a" && c <= "z" && (i === 0 || !isSchemeChar(s[i - 1]))) {
-      const se = matchSchemeEmail(s, i);
-      if (se && !autolinkBlocked(i, se.end)) {
-        flush();
-        items.push(se.node);
-        i = se.end;
-        continue;
+      let j = i;
+      while (j < n && isSchemeChar(s[j])) j++;
+      if (j < n && s[j] === ":") {
+        const se = matchSchemeEmail(s, i);
+        if (se && !autolinkBlocked(i, se.end)) {
+          flush();
+          items.push(se.node);
+          i = se.end;
+          continue;
+        }
       }
     }
 
