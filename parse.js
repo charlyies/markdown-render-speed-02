@@ -170,9 +170,6 @@ function scanInline(s, refs) {
   const n = s.length;
   const items = [];
   const openers = []; // indices into items of active "[" openers
-  // source index of the most recent "]" processed (link close attempt);
-  // used to tell link text apart from a link suffix (see extOk below)
-  let lastClosePos = -1;
   // source index of a "]" that a code-span search stopped at because
   // the span was broken there (see the code-span search below); a
   // later backtick opener before that "]" may not search past it
@@ -214,6 +211,56 @@ function scanInline(s, refs) {
         last.s.length === 0 ||
         !isEmailLocalChar(last.s[last.s.length - 1])
       );
+    }
+    return true;
+  }
+  // An extended autolink must not swallow the "]" (and suffix) of a
+  // link that will form: marked matches the link as a unit first, so
+  // a URL inside its label stays plain text and can never eat the
+  // "]". If the first "]" in the autolink's span closes an opener
+  // whose link would form (same checks as the "]" handler: the
+  // suffix parses, a referenced label is defined, no explicit link
+  // in the text so far, no backtick code span in the text so far —
+  // the autolink itself would be the content after it), the
+  // autolink is not formed at all and the URL is scanned as plain
+  // text; the link then forms and the URL stays text. If the link
+  // would NOT form (e.g. it already contains a link, doc-08/b7),
+  // the autolink forms and may swallow the "]".
+  function autolinkBlocked(i, end) {
+    if (openers.length === 0) return false;
+    const k = s.indexOf("]", i);
+    if (k < 0 || k >= end) return false;
+    let oi = -1;
+    for (let q = openers.length - 1; q >= 0; q--) {
+      if (items[openers[q]].active) {
+        oi = openers[q];
+        break;
+      }
+    }
+    if (oi < 0) return false;
+    const opener = items[oi];
+    const suffix = parseLinkSuffix(s, k + 1);
+    let formed;
+    if (suffix && suffix.kind === "inline") {
+      formed = true;
+    } else if (suffix && suffix.kind === "ref") {
+      formed = !!refs.get(normalizeLabel(suffix.label));
+    } else {
+      // collapsed / shortcut / malformed suffix: shortcut fallback
+      // on the raw label text
+      formed = !!refs.get(normalizeLabel(s.slice(opener.end, k)));
+    }
+    if (!formed) return false;
+    const children = items.slice(oi + 1);
+    if (!opener.bang && containsLink(children)) return false;
+    for (const node of children) {
+      if (
+        node.t === "code" &&
+        typeof node.s === "string" &&
+        node.s.includes("`")
+      ) {
+        return false;
+      }
     }
     return true;
   }
@@ -383,7 +430,6 @@ function scanInline(s, refs) {
     }
     if (c === "]") {
       flush();
-      lastClosePos = i;
       if (i >= codeSpanBoundary) codeSpanBoundary = -1;
       let openerIdx = -1;
       for (let k = openers.length - 1; k >= 0; k--) {
@@ -472,6 +518,14 @@ function scanInline(s, refs) {
       }
       const children = items.splice(openerIdx + 1);
       items.splice(openerIdx, 1);
+      // A formed link swallows extended autolinks in its text: they
+      // render as plain text, not links (marked puts no link inside
+      // a link). Only direct children are demoted, and only extended
+      // autolinks (ext); bracket autolinks stay links (doc-08), and
+      // an autolink inside a nested link/image child keeps the fate
+      // its own formation gave it. Images skip this: their alt text
+      // is plain text either way.
+      if (!opener.bang) demoteExtAutolinks(children);
       // every opener still on the stack past this one was inside the
       // link text; drop them (they are deactivated openers now)
       for (let k = openers.length - 1; k >= 0; k--) {
@@ -516,26 +570,19 @@ function scanInline(s, refs) {
     }
 
     // --- extended autolinks (GFM) ---------------------------------------
-    // They do not form inside link text: an opener that was pushed
-    // after the most recent "]" (so the URL lies between that "["
-    // and its closing "]") means the URL stays plain text. But once
-    // a "]" has been seen since the opener was pushed, the text is in
-    // a link suffix (or after a failed link), and autolinks form
-    // normally even though an outer "[" is still open (e.g. the
-    // "https://sub.domain.example.io)]" in doc-08). Bracket autolinks
-    // above are unaffected: they form inside link text and do not
-    // block the outer link.
-    let inLinkText = false;
-    for (let k = openers.length - 1; k >= 0; k--) {
-      const it = items[openers[k]];
-      if (it.active && it.pos > lastClosePos) {
-        inLinkText = true;
-        break;
-      }
-    }
-    // extended autolinks are also off while inside an <a> (see
-    // inLink above)
-    const extOk = !inLinkText && !inLink;
+    // They form everywhere during the scan, including inside a "["
+    // ... "]" label: whether one survives is decided when the link
+    // resolves, not here. If the link forms, every extended autolink
+    // among its direct children is demoted back to plain text (see
+    // demoteExtAutolinks); if the link fails, the autolinks stay
+    // links ("[see https://x.io here][99]", doc-39). Bracket
+    // autolinks <...> above are unaffected and are never demoted:
+    // marked renders them as links even inside a formed link
+    // ("[simple table **parse <https://x.io> stable**](...)", doc-08).
+    // Extended autolinks are off only while inside a raw <a> tag
+    // (see inLink above). One more guard (autolinkBlocked): a URL
+    // must not swallow the "]" of a link that will form.
+    const extOk = !inLink;
     if (extOk && c === "w" && s.startsWith("www.", i)) {
       const prev = i > 0 ? s[i - 1] : " ";
       if (
@@ -543,7 +590,7 @@ function scanInline(s, refs) {
         prev === "~" || prev === "("
       ) {
         const ext = matchExtendedUrl(s, i, 4);
-        if (ext) {
+        if (ext && !autolinkBlocked(i, ext.end)) {
           flush();
           items.push(ext.node);
           i = ext.end;
@@ -553,7 +600,7 @@ function scanInline(s, refs) {
     }
     if (extOk && (c === "h" || c === "H" || c === "f" || c === "F") && isSchemeUrl(s, i)) {
       const ext = matchExtendedUrl(s, i, 0);
-      if (ext) {
+      if (ext && !autolinkBlocked(i, ext.end)) {
         flush();
         items.push(ext.node);
         i = ext.end;
@@ -574,7 +621,7 @@ function scanInline(s, refs) {
         }
       }
       const em = matchEmail(s, i, openUnderscoreLens);
-      if (em) {
+      if (em && !autolinkBlocked(i, em.end)) {
         flush();
         items.push(em.node);
         i = em.end;
@@ -584,7 +631,7 @@ function scanInline(s, refs) {
     // scheme:email autolink: only tried at the start of a lowercase word
     if (extOk && c >= "a" && c <= "z" && (i === 0 || !isSchemeChar(s[i - 1]))) {
       const se = matchSchemeEmail(s, i);
-      if (se) {
+      if (se && !autolinkBlocked(i, se.end)) {
         flush();
         items.push(se.node);
         i = se.end;
@@ -972,7 +1019,7 @@ function matchExtendedUrl(s, i, prefixLen) {
   const href = prefixLen === 4 ? "http://" + text : text;
   return {
     node: {
-      t: "link", href, title: null, auto: true,
+      t: "link", href, title: null, auto: true, ext: true,
       children: [{ t: "text", s: shown }],
     },
     end: i + text.length,
@@ -1069,7 +1116,7 @@ function matchEmail(s, i, openUnderscoreLens) {
   const text = s.slice(i, domainEnd);
   return {
     node: {
-      t: "link", href: "mailto:" + text, title: null, auto: true,
+      t: "link", href: "mailto:" + text, title: null, auto: true, ext: true,
       children: [{ t: "text", s: text }],
     },
     end: domainEnd,
@@ -1121,7 +1168,7 @@ function matchSchemeEmail(s, i) {
   if (text.length === 0) return null;
   return {
     node: {
-      t: "link", href: text, title: null, auto: true,
+      t: "link", href: text, title: null, auto: true, ext: true,
       children: [{ t: "text", s: text }],
     },
     end: i + text.length,
@@ -1289,6 +1336,24 @@ function containsLink(nodes) {
     if (node.children && containsLink(node.children)) return true;
   }
   return false;
+}
+
+// Demote extended autolinks that are direct children of a link that
+// has just formed back to plain text: marked renders no link inside
+// a link, so "[see https://x.io here](u)" keeps the URL as text,
+// whether the URL sits before an inner "]" or after one ("[a
+// ![b](img) https://x.io c](u)"). Bracket autolinks (no ext flag)
+// are left alone — marked keeps them as links inside a formed link
+// (doc-08). Nested link/image children are not walked: an autolink
+// inside one already got its fate when that child formed, and an
+// image's alt text is plain text either way.
+function demoteExtAutolinks(nodes) {
+  for (let k = 0; k < nodes.length; k++) {
+    const node = nodes[k];
+    if (node.t === "link" && node.ext) {
+      nodes[k] = { t: "text", s: plainText(node.children) };
+    }
+  }
 }
 
 // Probed 16 Nov 2026 (probe79/80/81): a link does not form when its
