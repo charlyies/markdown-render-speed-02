@@ -1988,6 +1988,11 @@ class BlockParser {
       // blockquotes, so a new item's columns are measured from the
       // cursor minus what the open items already consumed
       this.itemIndentConsumed = 0;
+      // absolute column where the innermost list item matched on this
+      // line starts its content (0 if none matched yet); a tab after a
+      // ">" inside that item expands on the grid anchored there
+      // (doc-30, probed 16 Nov 2026)
+      this.itemContentCol = 0;
       this.processLine();
     }
     while (this.stack.length > 1) {
@@ -2027,6 +2032,7 @@ class BlockParser {
         const beforeCol = this.col;
         if (!this.tryItem(b)) break;
         this.itemIndentConsumed += this.col - beforeCol;
+        this.itemContentCol = this.col;
       }
       containerIdx++;
     }
@@ -2236,6 +2242,20 @@ class BlockParser {
     const items = list.children;
     for (let k = 0; k < items.length; k++) {
       const item = items[k];
+      // An HTML block that is an item's last child keeps its trailing
+      // newline when a blank line separates this item from the next
+      // one (the list is loose and continues): marked renders the
+      // newline even though the block's own line is followed by a
+      // blank line (h7/j7/k5/k6/k9, probed 16 Nov 2026). The
+      // "just ended" rule drops it, so restore it here.
+      if (
+        item.lastLineBlank &&
+        k + 1 < items.length &&
+        item.children.length > 0
+      ) {
+        const last = item.children[item.children.length - 1];
+        if (last.t === "html") last.lastTerminated = true;
+      }
       if (item.looseInner) {
         tight = false;
         break;
@@ -2257,6 +2277,24 @@ class BlockParser {
   }
 
   // --- container matching --------------------------------------------------
+  // After a ">" marker, one optional space is consumed. A tab there
+  // expands on the grid anchored at the innermost list item's content
+  // start (not the absolute column): marked expands it relative to the
+  // item, so a tab at relative column 1 becomes 3 columns and the
+  // quote consumes 1, leaving 2 spaces in the code (doc-30). At the
+  // top level (no item matched) the anchor is 0, i.e. absolute.
+  consumeAfterGt() {
+    const p = this.peek();
+    if (p === " ") {
+      this.advance(1);
+    } else if (p === "\t") {
+      const w = 4 - ((this.col - this.itemContentCol) % 4);
+      this.i++;
+      this.col += 1;
+      this.partial = w - 1;
+    }
+  }
+
   tryBlockquote() {
     if (this.isBlankFromCursor()) {
       // a blank line only matches if it carries the ">" marker; a blank
@@ -2266,8 +2304,7 @@ class BlockParser {
       if (this.peek() === ">") {
         this.i++;
         this.col++;
-        const p = this.peek();
-        if (p === " " || p === "\t") this.advance(1);
+        this.consumeAfterGt();
         return true;
       }
       this.restoreCursor(save);
@@ -2278,8 +2315,7 @@ class BlockParser {
     if (this.peek() === ">") {
       this.i++;
       this.col++;
-      const p = this.peek();
-      if (p === " " || p === "\t") this.advance(1);
+      this.consumeAfterGt();
       return true;
     }
     this.restoreCursor(save);
@@ -2683,8 +2719,10 @@ class BlockParser {
   // The HTML block just ended on the current line (its end marker was
   // found). A trailing newline is included only if the next line is
   // non-blank and stays inside the block's containers; at the end of the
-  // input it is included only at the top level.
-  htmlEndsWithNewline() {
+  // input it is included only at the top level. `upto` is forwarded to
+  // nextLineMatchesContainers (see there); `kind` selects its
+  // whitespace rule.
+  htmlEndsWithNewline(upto, kind) {
     const next = this.lineIndex + 1;
     if (next >= this.lines.length) return false;
     const line = this.lines[next];
@@ -2698,7 +2736,7 @@ class BlockParser {
     // keeps it for kind <= 5 blocks (comment, PI, CDATA, declaration,
     // script/pre/style) — it falls through to the container check.
     if (line === "") return false;
-    return this.nextLineMatchesContainers();
+    return this.nextLineMatchesContainers(upto, kind);
   }
 
   stackHasContainer() {
@@ -2710,20 +2748,32 @@ class BlockParser {
   }
 
   // Would the next line match every container the HTML block sits in?
-  // (Simulates phase-1 container matching on the next line.)
-  nextLineMatchesContainers() {
+  // (Simulates phase-1 container matching on the next line.) `upto` is
+  // the exclusive stack bound: by default the tip (the HTML block
+  // itself) is excluded; callers matching a block that is not yet on
+  // the stack pass the full length to include the parent container.
+  // `kind` selects the whitespace rule for the remainder: a
+  // whitespace-only remainder keeps the newline for kind <= 5 blocks
+  // (probe76/77) but drops it for kind 6/7 blocks.
+  nextLineMatchesContainers(upto = this.stack.length - 1, kind) {
     const saveS = this.s;
     const saveI = this.i;
     const saveCol = this.col;
     const savePartial = this.partial;
     const saveLineIndex = this.lineIndex;
+    const saveItemIndentConsumed = this.itemIndentConsumed;
+    const saveItemContentCol = this.itemContentCol;
     this.lineIndex = this.lineIndex + 1;
     this.s = this.lines[this.lineIndex];
     this.i = 0;
     this.col = 0;
     this.partial = 0;
+    // a fresh line starts with no item indent consumed (the previous
+    // line's value would make tryItem think the indent is already met)
+    this.itemIndentConsumed = 0;
+    this.itemContentCol = 0;
     let ok = true;
-    for (let k = 1; k < this.stack.length - 1; k++) {
+    for (let k = 1; k < upto; k++) {
       const b = this.stack[k];
       if (b.t === "list") continue;
       if (b.t === "quote") {
@@ -2732,17 +2782,39 @@ class BlockParser {
           break;
         }
       } else if (b.t === "item") {
+        const beforeCol = this.col;
         if (!this.tryItem(b)) {
           ok = false;
           break;
         }
+        // tryItem returns early for a blank line without consuming
+        // the item's indent; consume it here so rest() reflects the
+        // post-indent content (a line of just the indent is blank)
+        if (this.isBlankFromCursor()) {
+          const need = (b.contentIndent - b.baseCol) - this.itemIndentConsumed;
+          if (need > 0) this.advance(need);
+        }
+        this.itemIndentConsumed += this.col - beforeCol;
+        this.itemContentCol = this.col;
       } else break;
+    }
+    // the next line only keeps the block's trailing newline if it
+    // carries content inside the containers: a line that is blank
+    // within them (e.g. ">" alone, or just the item's indent) drops
+    // it, while a whitespace-only remainder keeps it for kind <= 5
+    // (probe76/77) but drops it for kind 6/7
+    if (ok) {
+      const rest = this.rest();
+      if (rest === "") ok = false;
+      else if (kind !== undefined && kind > 5 && /^[ \t]*$/.test(rest)) ok = false;
     }
     this.s = saveS;
     this.i = saveI;
     this.col = saveCol;
     this.partial = savePartial;
     this.lineIndex = saveLineIndex;
+    this.itemIndentConsumed = saveItemIndentConsumed;
+    this.itemContentCol = saveItemContentCol;
     return ok;
   }
 
@@ -2885,7 +2957,13 @@ class BlockParser {
     // including up to three spaces of indent.
     this.restoreCursor(save);
     const node = { t: "html", kind, endTag, lit: this.rest(), started: true };
-    node.lastTerminated = this.htmlLineTerminated(kind);
+    // A block that ends on this line takes the "block just ended" rule
+    // (not the line-based one): its trailing newline is kept only if
+    // the next line stays inside the block's parent container. The
+    // block is not on the stack yet, so include the tip (the parent)
+    // in the container check. Multi-line blocks get this overwritten
+    // when they end; kind 6/7 blocks get it overwritten per line.
+    node.lastTerminated = this.htmlEndsWithNewline(this.stack.length, kind);
     return node;
   }
 
