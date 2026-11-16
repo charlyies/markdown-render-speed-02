@@ -2354,8 +2354,10 @@ class BlockParser {
       if (tip.t === "html") {
         if ((tip.kind === 6 || tip.kind === 7) && this.isBlankFromCursor()) {
           // a trailing blank line at the very end of the input belongs
-          // to the block
-          if (this.lineIndex === this.lines.length - 1) {
+          // to the block — but only at the top level: inside a
+          // container the container's inner source ends without it
+          // (h2: a <div> in a list item must not gain the newline)
+          if (this.lineIndex === this.lines.length - 1 && !this.stackHasContainer()) {
             tip.lit += "\n" + this.rest();
             tip.lastTerminated = false;
           }
