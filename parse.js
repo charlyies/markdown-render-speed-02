@@ -228,8 +228,16 @@ function scanInline(s, refs) {
   // the autolink forms and may swallow the "]".
   function autolinkBlocked(i, end) {
     if (openers.length === 0) return false;
-    const k = s.indexOf("]", i);
-    if (k < 0 || k >= end) return false;
+    // first "]" inside the span (bounded scan — an unbounded
+    // indexOf would run to the end of the string on every match)
+    let k = -1;
+    for (let p = i; p < end; p++) {
+      if (s[p] === "]") {
+        k = p;
+        break;
+      }
+    }
+    if (k < 0) return false;
     let oi = -1;
     for (let q = openers.length - 1; q >= 0; q--) {
       if (items[openers[q]].active) {
@@ -1431,6 +1439,8 @@ function plainText(nodes) {
 // Returns absolute [start, end) source ranges of the paired spans
 // within s[lo, hi).
 function computeHiddenSpans(s, lo, hi) {
+  // fast path: no backtick in the range, no spans (native scan)
+  if (s.indexOf("`", lo) < 0 || s.indexOf("`", lo) >= hi) return [];
   // collect maximal backtick runs in the range
   const runs = [];
   let i = lo;
