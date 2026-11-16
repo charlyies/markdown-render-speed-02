@@ -532,10 +532,13 @@ function scanInline(s, refs) {
         if (openers[k] >= openerIdx) openers.splice(k, 1);
       }
       let node;
+      // ls/le: source range of the link text, so emphasis inside it
+      // can be masked against the label alone (marked tokenizes a
+      // link's text separately from the surrounding text).
       if (opener.bang) {
-        node = { t: "image", src: href, title, children };
+        node = { t: "image", src: href, title, children, ls: opener.end, le: i };
       } else {
-        node = { t: "link", href, title, children };
+        node = { t: "link", href, title, children, ls: opener.end, le: i };
       }
       items.push(node);
       i = isShortcut ? i + 1 : suffix.end;
@@ -564,7 +567,7 @@ function scanInline(s, refs) {
         canClose = rightFlanking;
       }
       flush();
-      items.push({ t: "delim", ch: c, len, canOpen, canClose, seq: delimSeq++ });
+      items.push({ t: "delim", ch: c, len, canOpen, canClose, seq: delimSeq++, pos: i });
       i = j;
       continue;
     }
@@ -1414,6 +1417,63 @@ function plainText(nodes) {
   return out;
 }
 
+// Hidden spans for emphasis (probed 16 Nov 2026, doc-09): marked
+// masks an inline string before looking for emphasis closers, by
+// pairing backtick runs left to right — a run pairs with the nearest
+// later run of exactly the same length, and the text between a pair
+// is hidden, so a "*" / "_" delimiter inside it cannot close (an
+// opener inside it still can: it pairs with a later visible closer,
+// e.g. "[docs ``url`](u) and _a_ here `code` and b_" forms an <em>
+// spanning the code span). An escaped backtick reached directly is
+// masked and is not a run, but one reached as the closer of an
+// earlier run does count (the "[docs ``url`](u) and _em_ here \`"
+// case). "~" delimiters are never hidden (del forms normally).
+// Returns absolute [start, end) source ranges of the paired spans
+// within s[lo, hi).
+function computeHiddenSpans(s, lo, hi) {
+  // collect maximal backtick runs in the range
+  const runs = [];
+  let i = lo;
+  while (i < hi) {
+    if (s[i] === "`") {
+      let j = i;
+      while (j < hi && s[j] === "`") j++;
+      runs.push({ start: i, end: j, len: j - i });
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  const spans = [];
+  let k = 0;
+  while (k < runs.length) {
+    const r = runs[k];
+    // an escaped run (odd number of backslashes before it) is masked
+    // and cannot open a pair — unless an earlier run already claimed
+    // it as its closer (handled by the partner search below, which
+    // does not check escaping)
+    let b = r.start - 1;
+    let slashes = 0;
+    while (b >= lo && s[b] === "\\") {
+      slashes++;
+      b--;
+    }
+    if (slashes % 2 === 1) {
+      k++;
+      continue;
+    }
+    let j = k + 1;
+    while (j < runs.length && runs[j].len !== r.len) j++;
+    if (j < runs.length) {
+      spans.push([r.start, runs[j].end]);
+      k = j + 1;
+    } else {
+      k++;
+    }
+  }
+  return spans;
+}
+
 // --- emphasis --------------------------------------------------------------
 // Delimiter-stack algorithm (CommonMark). Closers are processed left to
 // right; each looks back through the stack of openers for the first match
@@ -1423,63 +1483,43 @@ function plainText(nodes) {
 // A "~" pair is a <del> and needs one or two tildes, the same number on
 // each side (a run of three or more never forms a <del>).
 // Link and image nodes are opaque here; their children are processed first.
-function processEmphasis(items) {
+// s is the source of this inline string and ls/le its range within it:
+// a link's text is masked against its label alone (marked tokenizes a
+// link's text separately), so the recursion passes each node's ls/le.
+function processEmphasis(items, s, ls, le) {
   for (const item of items) {
     if (item.t === "link" || item.t === "image") {
-      processEmphasis(item.children);
+      // autolinks carry no ls/le (their children hold no delimiters);
+      // fall back to this level's range for them.
+      processEmphasis(
+        item.children,
+        s,
+        item.ls === undefined ? ls : item.ls,
+        item.le === undefined ? le : item.le,
+      );
     }
   }
-  // Pre-pass (probed 16 Nov 2026, probe86/87/88): a link or image whose
-  // text holds a literal backtick, followed later in the same inline
-  // string by a code span, suppresses emphasis delimiters between
-  // them — marked leaves those delimiters literal. A proper code span
-  // (even one whose content holds a backtick) does not trigger this;
-  // only a backtick sitting in a text node does. The code span may be
-  // nested inside a later link or image (its position is that node's).
-  // The suppression runs only up to the FIRST code span after the
-  // link: once a code span has intervened, later emphasis is normal
-  // again (doc-07: a `lib/main.js` span before the emphasis lets it
-  // form).
-  const hasLiteralBacktick = (node) => {
-    if (!node.children) return false;
-    for (const c of node.children) {
-      if (c.t === "text" && typeof c.s === "string" && c.s.includes("`")) return true;
-      if ((c.t === "link" || c.t === "image") && hasLiteralBacktick(c)) return true;
-    }
-    return false;
-  };
-  const hasCodeSpan = (node) => {
-    if (!node.children) return false;
-    for (const c of node.children) {
-      if (c.t === "code") return true;
-      if ((c.t === "link" || c.t === "image") && hasCodeSpan(c)) return true;
-    }
-    return false;
-  };
-  let minBroken = -1;
-  for (let k = 0; k < items.length; k++) {
-    const it = items[k];
-    if ((it.t === "link" || it.t === "image") && hasLiteralBacktick(it)) {
-      minBroken = k;
-      break;
-    }
-  }
-  let firstCode = -1;
-  if (minBroken >= 0) {
-    for (let k = minBroken + 1; k < items.length; k++) {
-      const it = items[k];
-      if (it.t === "code" || ((it.t === "link" || it.t === "image") && hasCodeSpan(it))) {
-        firstCode = k;
-        break;
-      }
-    }
-  }
-  if (minBroken >= 0 && firstCode > minBroken) {
-    for (let k = minBroken + 1; k < firstCode; k++) {
-      const it = items[k];
-      if (it.t === "delim" && (it.ch === "*" || it.ch === "_")) {
-        it.canOpen = false;
-        it.canClose = false;
+  // Pre-pass (probed 16 Nov 2026, doc-09): a "*" / "_" delimiter
+  // whose source position lies inside a hidden span (see
+  // computeHiddenSpans) cannot close emphasis. Only canClose is
+  // cleared — the delimiter may still open, and pair with a later
+  // visible closer. Delimiters outside any span are untouched, and
+  // "~" is never touched.
+  const spans = computeHiddenSpans(s, ls, le);
+  if (spans.length > 0) {
+    for (const it of items) {
+      if (
+        it.t === "delim" &&
+        (it.ch === "*" || it.ch === "_") &&
+        it.canClose &&
+        typeof it.pos === "number"
+      ) {
+        for (const sp of spans) {
+          if (it.pos > sp[0] && it.pos < sp[1]) {
+            it.canClose = false;
+            break;
+          }
+        }
       }
     }
   }
@@ -1684,7 +1724,7 @@ function convertDelims(items) {
 function parseInline(s, refs) {
   if (s === "") return [];
   const items = scanInline(s, refs);
-  processEmphasis(items);
+  processEmphasis(items, s, 0, s.length);
   return items;
 }
 
